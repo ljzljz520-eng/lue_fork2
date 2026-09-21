@@ -23,9 +23,11 @@ TTS_OVERLAP_SECONDS = {
 }
 
 # Audio processing settings
+# Per-instance clip directories are created here at runtime (see
+# audio.create_audio_temp_dir); clips get unique file names instead of
+# shared fixed buffer slots so concurrent instances can't collide.
 AUDIO_DATA_DIR = user_cache_dir("lue")
 os.makedirs(AUDIO_DATA_DIR, exist_ok=True)
-AUDIO_BUFFERS = [os.path.join(AUDIO_DATA_DIR, f"buffer_{i}") for i in range(6)]
 MAX_QUEUE_SIZE = 4
 OVERLAP_SECONDS = 0.5 # Seconds of overlap between sentences
 

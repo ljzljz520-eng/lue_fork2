@@ -42,10 +42,16 @@ class Lue:
         self.active_playback_tasks = []
         self.audio_restart_lock = asyncio.Lock()
         self.pending_restart_task = None
+        # Playback session token: bumped on every stop/restart. Producer
+        # and player loops are bound to the id they started with, so old
+        # loops can never push state back into the main loop after a
+        # navigation, speed change, or book switch.
+        self.audio_session_id = 0
+        # Private clip directory for this reader instance only.
+        self.audio_temp_dir = audio.create_audio_temp_dir()
         self.playback_speed = 1.0  # Default speed multiplier
         
-        # Add pause toggle lock and task tracking
-        self.pause_toggle_lock = asyncio.Lock()
+        # Pause toggle task tracking (serialized on audio_restart_lock)
         self.current_pause_toggle_task = None
 
         # Recent books menu state
@@ -171,7 +177,7 @@ class Lue:
         self._scroll_to_position_immediate(chapter_idx, para_idx, 0)
         self._save_extended_progress(sync_audio_position=True)
         if not self.is_paused and self.tts_model:
-            self.pending_restart_task = asyncio.create_task(self._restart_audio_after_navigation())
+            self._schedule_audio_restart()
         else:
             await audio.stop_and_clear_audio(self)
         asyncio.create_task(ui.display_ui(self))
@@ -934,25 +940,57 @@ class Lue:
                     self.scroll_offset = self.target_scroll_offset = new_offset
             self._save_extended_progress(sync_audio_position=True)
 
+    # Debounce window for coalescing rapid clicks / navigation / speed
+    # changes into a single audio restart.
+    AUDIO_RESTART_DEBOUNCE = 0.1
+
+    def _schedule_audio_restart(self):
+        """Coalesce rapid inputs into one restart.
+
+        Each new navigation cancels the previously scheduled restart while
+        it is still debouncing, so only the last one actually runs and it
+        always reads the final reading position/speed.
+        """
+        old = self.pending_restart_task
+        if old and not old.done():
+            old.cancel()
+        self.pending_restart_task = asyncio.create_task(self._restart_audio_after_navigation())
+
+    def _schedule_pause_toggle(self):
+        """Schedule a pause/resume transition, superseding a pending one."""
+        old = self.current_pause_toggle_task
+        if old and not old.done():
+            old.cancel()
+        self.current_pause_toggle_task = asyncio.create_task(self._handle_pause_toggle())
+
     async def _restart_audio_after_navigation(self):
-        """Restart audio after navigation, preventing concurrent executions."""
+        """Debounced, session-aware audio restart.
+
+        Cancelled-and-rescheduled by _schedule_audio_restart while still in
+        the debounce wait; the identity check below ensures a task that lost
+        the race never tears down a newer session.
+        """
+        task = asyncio.current_task()
+        try:
+            await asyncio.sleep(self.AUDIO_RESTART_DEBOUNCE)
+        except asyncio.CancelledError:
+            return
+
+        if self.is_paused or not self.running or not self.tts_model:
+            return
+
         async with self.audio_restart_lock:
-            # Cancel any pending restart task
-            if self.pending_restart_task and not self.pending_restart_task.done():
-                self.pending_restart_task.cancel()
-                try:
-                    await self.pending_restart_task
-                except asyncio.CancelledError:
-                    pass
-            
+            # Superseded by an even newer navigation, or shutting down.
+            if self.pending_restart_task is not task:
+                return
+            if self.is_paused or not self.running or not self.tts_model:
+                return
+
             await audio.stop_and_clear_audio(self)
-            
-            # Add a small delay to debounce rapid navigation
-            await asyncio.sleep(0.1)
-            
-            # Check if we're still running and not paused after the delay
+            # stop_and_clear_audio invalidated the old session and bumped
+            # audio_session_id; start loops bound to the fresh id.
             if not self.is_paused and self.running:
-                await audio.play_from_current_position(self)
+                audio.start_playback(self)
 
     def _handle_page_scroll_immediate(self, direction):
         self.auto_scroll_enabled = False
@@ -1053,22 +1091,23 @@ class Lue:
         self._save_extended_progress()
 
     async def _handle_pause_toggle(self):
-        """Handle pause/resume toggle with proper locking to prevent concurrent audio playback."""
-        async with self.pause_toggle_lock:
-            # Cancel any existing pause toggle task
-            if self.current_pause_toggle_task and not self.current_pause_toggle_task.done():
-                self.current_pause_toggle_task.cancel()
-                try:
-                    await self.current_pause_toggle_task
-                except asyncio.CancelledError:
-                    pass
-            
-            # Stop current audio playback
+        """Handle a pause/resume toggle.
+
+        Serialized together with navigation restarts on audio_restart_lock;
+        the identity guard makes a task that was superseded by a newer
+        keypress a no-op (it never cancels itself by mistake).
+        """
+        task = asyncio.current_task()
+        async with self.audio_restart_lock:
+            if self.current_pause_toggle_task is not task:
+                return
+
+            # Stop current audio playback (bumps the session id)
             await audio.stop_and_clear_audio(self)
-            
+
             # Only start playback if we're not paused and still running
             if not self.is_paused and self.running and self.tts_model:
-                await audio.play_from_current_position(self)
+                audio.start_playback(self)
 
     def _handle_resize(self, signum, frame):
         if not self.resize_scheduled:
@@ -1231,6 +1270,7 @@ class Lue:
                     pass
         
         await audio.stop_and_clear_audio(self)
+        audio.cleanup_audio_temp_dir(self)
         self._save_extended_progress()
         logging.info("--- Application Shutting Down ---")
         # Disable mouse reporting and restore terminal (switch back to main buffer)
@@ -1417,8 +1457,15 @@ class Lue:
                 if command_name == '_update_highlight':
                     if not self.is_paused: self.chapter_idx, self.paragraph_idx, self.sentence_idx = data
                 elif command_name == '_new_sentence_started':
-                    c, p, s, duration, timing_data = data
-                    
+                    event_session_id, c, p, s, duration, timing_data = data
+
+                    # Reject events from producer/player loops that have
+                    # since been superseded (rapid navigation/click/speed
+                    # change). Without this, an old, already-queued event
+                    # would overwrite the position the user just picked.
+                    if event_session_id != self.audio_session_id:
+                        continue
+
                     # Update sentence position
                     self.chapter_idx, self.paragraph_idx, self.sentence_idx = c, p, s
                     
@@ -1449,11 +1496,17 @@ class Lue:
                 elif command_name == 'click_jump':
                     if clicked_position := self._find_sentence_at_click(*data):
                         self.first_sentence_jump = False
+                        # Silence the current sentence right away and
+                        # invalidate its session so any event the old
+                        # player already queued is rejected. Only this
+                        # reader's own ffplay processes are signalled.
+                        audio.invalidate_session(self)
+                        audio.kill_playback_now(self)
                         self.chapter_idx, self.paragraph_idx, self.sentence_idx = clicked_position
                         self.ui_chapter_idx, self.ui_paragraph_idx, self.ui_sentence_idx = clicked_position
                         self.auto_scroll_enabled = False
                         self._save_extended_progress(sync_audio_position=True)
-                        self.pending_restart_task = asyncio.create_task(self._restart_audio_after_navigation())
+                        self._schedule_audio_restart()
                 elif command_name == 'chapter_click':
                     x, y = data
                     panel_x = self.chapter_index_panel_x
@@ -1531,7 +1584,7 @@ class Lue:
                 self.is_paused = not self.is_paused
                 self._save_extended_progress()
                 # Track the pause toggle task for proper management
-                self.current_pause_toggle_task = asyncio.create_task(self._handle_pause_toggle())
+                self._schedule_pause_toggle()
             elif cmd in ['scroll_page_up', 'scroll_page_down']:
                 if config.SMOOTH_SCROLLING_ENABLED:
                     self._handle_page_scroll_smooth(-1 if 'up' in cmd else 1)
@@ -1571,7 +1624,7 @@ class Lue:
                     self._handle_move_to_top_smooth()
                 else:
                     self._handle_move_to_top_immediate()
-                self.pending_restart_task = asyncio.create_task(self._restart_audio_after_navigation())
+                self._schedule_audio_restart()
             elif cmd == 'move_to_beginning':
                 if config.SMOOTH_SCROLLING_ENABLED:
                     self._handle_move_to_beginning_smooth()
@@ -1590,14 +1643,14 @@ class Lue:
                     asyncio.create_task(ui.display_ui(self))
                     # Restart audio with new speed if currently playing
                     if not self.is_paused and self.tts_model:
-                        self.pending_restart_task = asyncio.create_task(self._restart_audio_after_navigation())
+                        self._schedule_audio_restart()
             elif cmd == 'decrease_speed':
                 if self._decrease_speed():
                     # Force immediate UI update to show new speed
                     asyncio.create_task(ui.display_ui(self))
                     # Restart audio with new speed if currently playing
                     if not self.is_paused and self.tts_model:
-                        self.pending_restart_task = asyncio.create_task(self._restart_audio_after_navigation())
+                        self._schedule_audio_restart()
             elif cmd == 'toggle_sentence_highlight':
                 config.SENTENCE_HIGHLIGHTING_ENABLED = not config.SENTENCE_HIGHLIGHTING_ENABLED
                 # Force immediate UI update
@@ -1615,6 +1668,6 @@ class Lue:
                     self._handle_navigation_smooth(cmd)
                 else:
                     self._handle_navigation_immediate(cmd)
-                self.pending_restart_task = asyncio.create_task(self._restart_audio_after_navigation())
+                self._schedule_audio_restart()
                         
         await self._shutdown()

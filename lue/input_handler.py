@@ -1,9 +1,10 @@
 import sys
-import subprocess
 import json
 import os
 import re
 import time
+
+from . import audio
 
 # Default keyboard shortcuts
 DEFAULT_KEYBOARD_SHORTCUTS = {
@@ -95,7 +96,12 @@ def _process_escape_sequence(reader, seq):
 
     if cmd:
         if cmd in ('prev_paragraph', 'next_paragraph', 'prev_sentence', 'next_sentence'):
-            _kill_audio_immediately(reader)
+            # Immediate, instance-local silence: invalidate the session so
+            # the old loops stop emitting events, then kill only our own
+            # ffplay processes. The nav command itself schedules the
+            # debounced restart.
+            audio.invalidate_session(reader)
+            audio.kill_playback_now(reader)
         reader.post_command(cmd)
 
 
@@ -130,10 +136,10 @@ def _process_mouse_sequence(reader, sequence):
                         if not reader._is_click_on_text(x_pos, y_pos):
                             return
 
-                        if hasattr(reader, 'pending_restart_task') and reader.pending_restart_task and not reader.pending_restart_task.done():
-                            reader.pending_restart_task.cancel()
-
-                        _kill_audio_immediately(reader)
+                        # The click_jump handler silences the current
+                        # sentence and invalidates the session atomically,
+                        # but only when the click actually resolves to a
+                        # sentence (so blank-area clicks don't kill audio).
                         reader.post_command(('click_jump', (x_pos, y_pos)))
                     elif button == 64:
                         if reader.auto_scroll_enabled:
@@ -290,18 +296,4 @@ def process_input(reader):
                 reader.esc_start_time = None
             break
     except Exception:
-        pass
-
-
-def _kill_audio_immediately(reader):
-    """Kill audio playback immediately."""
-    for process in reader.playback_processes[:]:
-        try:
-            process.kill()
-        except (ProcessLookupError, AttributeError):
-            pass
-    try:
-        subprocess.run(['pkill', '-f', 'ffplay'], check=False, 
-                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    except (subprocess.CalledProcessError, FileNotFoundError):
         pass
